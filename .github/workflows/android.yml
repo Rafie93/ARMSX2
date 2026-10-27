@@ -59,8 +59,12 @@ jobs:
             17
             21
 
+      # Wrapper validation scans every gradle-wrapper.jar in the checkout, and the vendored SDL3
+      # android-project ships one with a checksum Gradle doesn't list. We only run our own wrapper.
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: false
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
