@@ -1,0 +1,110 @@
+# Android-only APK build, run by hand from the Actions tab (or `gh workflow run android.yml`).
+#
+# Same recipe as the `android` job in build-all.yml, but builds ONE variant instead of
+# `assembleRelease` (which compiles the native core once per flavour), and skips the PC/iOS jobs.
+# No secrets are needed: without armsx2_keystore.properties the APK is signed with the runner's
+# debug keystore, and without DISCORD_SDK_DIR the Discord feature compiles out.
+name: Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Store flavour (github = sideload, all-files access)"
+        type: choice
+        options: [github, play]
+        default: github
+      buildType:
+        description: "Build type"
+        type: choice
+        options: [release, debug]
+        default: release
+      pageSize:
+        description: "Host page size of the target phone (adb shell getconf PAGE_SIZE)"
+        type: choice
+        options: ["4k", "16k"]
+        default: "4k"
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android APK (${{ inputs.flavor }} ${{ inputs.buildType }}, ${{ inputs.pageSize }} pages)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: platforms/android
+    steps:
+      # The native core is built with -g (and LTO for release); the default runner's free space is
+      # tight for that, so drop toolchains this job never uses.
+      - name: Free disk space
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+          df -h /
+
+      - uses: actions/checkout@v7
+
+      # AGP runs on 17; gradle-daemon-jvm.properties asks for a 21 daemon. Installing both up front
+      # avoids the foojay download at configure time. The last one listed becomes JAVA_HOME.
+      - name: Set up JDK 17 + 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            21
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The action's default "tools" package no longer exists and fails the job.
+          packages: platform-tools
+
+      # Pins from app/build.gradle.kts. cmake 3.22.1 (AGP's default) cannot configure spirv-tools.
+      - name: Install NDK + CMake
+        run: yes | sdkmanager "ndk;29.0.14206865" "cmake;3.31.6" >/dev/null || true
+
+      # shaderc's SPIRV-Tools/glslang/etc. are fetched on demand, not vendored.
+      - name: Fetch shaderc third-party deps
+        run: python3 app/src/main/cpp/3rdparty/shaderc/utils/git-sync-deps
+
+      # librashader is cargo-built for the Android target; without it: "can't find crate for `core`".
+      - name: Install Rust Android target
+        run: rustup target add aarch64-linux-android
+
+      - name: Build APK
+        run: |
+          flavor="${{ inputs.flavor }}"
+          type="${{ inputs.buildType }}"
+          if [ "${{ inputs.pageSize }}" = "16k" ]; then page=0x4000; else page=0x1000; fi
+          task=":app:assemble${flavor^}${type^}"
+          echo "Running $task with armsx2.hostPageSize=$page"
+          ./gradlew "$task" -Parmsx2.hostPageSize="$page" --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: armsx2-android-${{ inputs.flavor }}-${{ inputs.buildType }}-${{ inputs.pageSize }}-${{ github.sha }}
+          path: platforms/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+      # CMake/Ninja logs are the useful part of a native build failure; Gradle's console only
+      # shows the tail.
+      - name: Upload native build logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-native-logs-${{ github.sha }}
+          path: |
+            platforms/android/app/.cxx/**/*.log
+            platforms/android/app/.cxx/**/CMakeFiles/*.log
+            platforms/android/app/.cxx/**/CMakeCache.txt
+          if-no-files-found: ignore
